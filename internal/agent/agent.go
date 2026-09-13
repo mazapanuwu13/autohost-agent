@@ -3,14 +3,12 @@ package agent
 import (
 	"context"
 	"log"
-	"time"
 
 	"autohost-agent/internal/api"
 	"autohost-agent/internal/commands"
 	"autohost-agent/internal/domain"
 	"autohost-agent/internal/services"
 	"autohost-agent/internal/transport"
-	"autohost-agent/pkg/sysinfo"
 )
 
 // Agent is the top-level orchestrator that coordinates all subsystems:
@@ -90,9 +88,6 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 	}
 
-	// Start background network stats reporter (every 30 s).
-	go a.networkStatsLoop(ctx)
-
 	if a.cfg.GRPCAddress == "" {
 		log.Println("ℹ️  gRPC address not configured — agent is idle")
 		<-ctx.Done()
@@ -103,53 +98,5 @@ func (a *Agent) Run(ctx context.Context) error {
 		log.Printf("gRPC client stopped: %v", err)
 	}
 	return ctx.Err()
-}
-
-// networkStatsLoop collects network interface stats and listening ports from
-// /proc (kernel-native, no external tools) every 30 seconds and POSTs them
-// to the API for display in the topology map.
-func (a *Agent) networkStatsLoop(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	// Send once immediately on startup.
-	a.sendNetworkStats(ctx)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			a.sendNetworkStats(ctx)
-		}
-	}
-}
-
-func (a *Agent) sendNetworkStats(ctx context.Context) {
-	ifaces, err := sysinfo.GetNetworkStats()
-	if err != nil {
-		log.Printf("⚠️  network stats: %v", err)
-		return
-	}
-	ports, err := sysinfo.GetListeningPorts()
-	if err != nil {
-		log.Printf("⚠️  listening ports: %v", err)
-		return
-	}
-	peers, _ := sysinfo.GetVPNPeers()
-	conns, _ := sysinfo.GetActiveConnections()
-	reqs, rps, _ := sysinfo.GetRecentHTTPRequests()
-
-	payload := &api.NetworkStatsPayload{
-		Interfaces:  ifaces,
-		Ports:       ports,
-		Peers:       peers,
-		Connections: conns,
-		Requests:    reqs,
-		RPS:         rps,
-	}
-	if err := a.apiClient.SendNetworkStats(ctx, payload); err != nil {
-		log.Printf("⚠️  send network stats: %v", err)
-	}
 }
 

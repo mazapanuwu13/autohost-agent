@@ -1,20 +1,25 @@
-.PHONY: build clean install uninstall run test release deploy-vm vm-start vm-stop vm-status vm-logs vm-shell incus-setup incus-create deploy-incus deploy-incus-update incus-start incus-stop incus-status incus-logs incus-shell
+SHELL := /bin/bash
+.PHONY: build clean install uninstall run test release deploy-vm vm-start vm-stop vm-status vm-logs vm-shell setup-incus create-incus deploy-incus update-incus start-incus stop-incus status-incus logs-incus shell-incus create-server delete-server list-servers shell-server enroll-server link-server restart-incus
 
-BINARY_NAME=autohost-agent
-INSTALL_PATH=/usr/local/bin
-CONFIG_PATH=/etc/autohost
-SERVICE_PATH=/etc/systemd/system
-VM_NAME=autohost-test
-INCUS_INSTANCE=autohost-test
+BINARY_NAME  = autohost-agent
+INSTALL_PATH = /usr/local/bin
+CONFIG_PATH  = /etc/autohost
+SERVICE_PATH = /etc/systemd/system
+
+# Target instance name (defaults to autohost-test, customizable via INSTANCE=... or NAME=...)
+INSTANCE ?= autohost-test
+NAME     ?= $(INSTANCE)
+RAM      ?= 512MiB
+CPU      ?= 1
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 LDFLAGS  = -s -w -X main.Version=$(VERSION)
 PLATFORMS = linux/amd64 linux/arm64
 
 build:
-	@echo "Building $(BINARY_NAME) $(VERSION)..."
+	@echo "🔨 Building $(BINARY_NAME) $(VERSION)..."
 	go build -ldflags "$(LDFLAGS)" -o $(BINARY_NAME) cmd/agent/main.go
-	@echo "Build complete: ./$(BINARY_NAME)"
+	@echo "✅ Build complete: ./$(BINARY_NAME)"
 
 release:
 	@CURRENT=$$(git describe --tags --always --dirty 2>/dev/null || echo "dev"); \
@@ -38,11 +43,10 @@ release:
 	ls -lh dist/; \
 	echo ""; \
 	git push origin "$$NEW_VERSION"; \
-	echo "🎉 Release $$NEW_VERSION creada y subida a GitHub"; \
+	echo "🎉 Release $$NEW_VERSION creada y subida a GitHub"
 
+# ─── Incus Infrastructure ───────────────────────────────────────────────────
 
-
-# Incus setup — instala y configura Incus en esta máquina
 setup-incus:
 	@echo "📦 Instalando Incus..."
 	@if command -v incus >/dev/null 2>&1; then \
@@ -50,7 +54,7 @@ setup-incus:
 	else \
 		sudo apt-get update -qq && sudo apt-get install -y incus; \
 	fi
-	@echo "⚙️  Inicializando Incus (modo minimal)..."
+	@echo "⚙️  Inicializando Incus..."
 	@if ! incus info >/dev/null 2>&1; then \
 		echo "{}" | sudo incus admin init --preseed; \
 	else \
@@ -59,96 +63,189 @@ setup-incus:
 	@echo "👤 Añadiendo usuario $$(whoami) al grupo incus..."
 	@if ! id -nG $$(whoami) | grep -qw incus; then \
 		sudo usermod -aG incus $$(whoami); \
-		echo "✅ Usuario añadido al grupo incus"; \
-		echo "⚠️  Cierra sesión y vuelve a entrar (o ejecuta: newgrp incus) para aplicar el grupo"; \
+		echo "✅ Usuario añadido al grupo incus (ejecuta: newgrp incus)"; \
 	else \
 		echo "✅ Ya perteneces al grupo incus"; \
 	fi
-	@echo ""
-	@echo "✓ Incus listo. Crea la instancia de prueba con: make create-incus"
 
-create-incus:
-	@echo "🚀 Creando instancia $(INCUS_INSTANCE)..."
-	@if incus info $(INCUS_INSTANCE) >/dev/null 2>&1; then \
-		echo "✅ La instancia $(INCUS_INSTANCE) ya existe"; \
+create-server:
+	@echo "🚀 Creando servidor '$(NAME)' con $(RAM) de RAM y $(CPU) CPU..."
+	@if incus info $(NAME) >/dev/null 2>&1; then \
+		echo "✅ La instancia '$(NAME)' ya existe"; \
 	else \
-		incus launch images:ubuntu/24.04 $(INCUS_INSTANCE); \
-		echo "✅ Instancia $(INCUS_INSTANCE) creada"; \
+		incus launch images:ubuntu/24.04 $(NAME) -c limits.memory=$(RAM) -c limits.cpu=$(CPU) -c security.nesting=true; \
+		echo "⏳ Esperando arranque..."; \
+		sleep 4; \
+		echo "📦 Instalando Docker y dependencias en $(NAME)..."; \
+		incus exec $(NAME) -- apt-get update -qq; \
+		incus exec $(NAME) -- apt-get install -y -qq docker.io curl wireguard-tools; \
+		echo "✅ Servidor '$(NAME)' listo."; \
 	fi
 
-# Incus deployment and management targets
-deploy-incus: build create-incus
-	@echo "Deploying to Incus instance $(INCUS_INSTANCE)..."
+create-incus: create-server
 
-	@echo "1. Transferring files..."
-	incus file push $(BINARY_NAME) $(INCUS_INSTANCE)/home/ubuntu/
-	incus file push configs/agent.yaml $(INCUS_INSTANCE)/home/ubuntu/
-	incus file push autohost-agent.service $(INCUS_INSTANCE)/home/ubuntu/
+delete-server:
+	@echo "🗑️  Eliminando servidor '$(NAME)'..."
+	-incus stop $(NAME) --force 2>/dev/null || true
+	-incus delete $(NAME) 2>/dev/null || true
+	@echo "✅ Servidor '$(NAME)' eliminado."
 
-	@echo "2. Installing on instance..."
+list-servers:
+	@incus list
 
-	# Create system user if not exists
-	incus exec $(INCUS_INSTANCE) -- sudo id -u autohost >/dev/null 2>&1 || \
-		incus exec $(INCUS_INSTANCE) -- sudo useradd --system --no-create-home --shell /usr/sbin/nologin autohost
+shell-server:
+	@INSTANCES=($$(incus list -c n --format csv)); \
+	if [ $${#INSTANCES[@]} -eq 0 ]; then \
+		echo "❌ No hay instancias Incus disponibles."; \
+		exit 1; \
+	elif [ "$$NAME" != "autohost-test" ] && [ -n "$$NAME" ] && incus info "$$NAME" >/dev/null 2>&1; then \
+		echo "🚀 Conectando a '$$NAME'..."; \
+		incus exec "$$NAME" -- bash; \
+	elif [ $${#INSTANCES[@]} -eq 1 ]; then \
+		echo "🚀 Conectando a $${INSTANCES[0]}..."; \
+		incus exec "$${INSTANCES[0]}" -- bash; \
+	else \
+		echo "📋 Servidores Incus disponibles:"; \
+		echo ""; \
+		for i in "$${!INSTANCES[@]}"; do \
+			STATUS=$$(incus list "$${INSTANCES[$$i]}" -c s --format csv); \
+			IPV4=$$(incus list "$${INSTANCES[$$i]}" -c 4 --format csv | head -n1); \
+			printf "  [\033[1;32m%d\033[0m] %-20s (\033[1;34m%s\033[0m, %s)\n" "$$((i+1))" "$${INSTANCES[$$i]}" "$$STATUS" "$$IPV4"; \
+		done; \
+		echo ""; \
+		printf "👉 Selecciona el número de servidor [1-%d]: " "$${#INSTANCES[@]}"; \
+		read -r CHOICE; \
+		if ! [[ "$$CHOICE" =~ ^[0-9]+$$ ]] || [ "$$CHOICE" -lt 1 ] || [ "$$CHOICE" -gt "$${#INSTANCES[@]}" ]; then \
+			echo "❌ Selección inválida"; \
+			exit 1; \
+		fi; \
+		SELECTED="$${INSTANCES[$$((CHOICE-1))]}"; \
+		echo "🚀 Conectando a $$SELECTED..."; \
+		incus exec "$$SELECTED" -- bash; \
+	fi
 
-	# Create config directory
-	incus exec $(INCUS_INSTANCE) -- sudo mkdir -p /etc/autohost
+# ─── Deployment & Lifecycle Management ──────────────────────────────────────
 
-	# Install binary
-	incus exec $(INCUS_INSTANCE) -- sudo mv /home/ubuntu/$(BINARY_NAME) /usr/local/bin/
-	incus exec $(INCUS_INSTANCE) -- sudo chown root:root /usr/local/bin/$(BINARY_NAME)
-	incus exec $(INCUS_INSTANCE) -- sudo chmod 755 /usr/local/bin/$(BINARY_NAME)
-
-	# Install config
-	incus exec $(INCUS_INSTANCE) -- sudo mv /home/ubuntu/agent.yaml /etc/autohost/config.yaml
-	incus exec $(INCUS_INSTANCE) -- sudo chown root:autohost /etc/autohost/config.yaml
-	incus exec $(INCUS_INSTANCE) -- sudo chmod 640 /etc/autohost/config.yaml
-
-	# Install service
-	incus exec $(INCUS_INSTANCE) -- sudo mv /home/ubuntu/autohost-agent.service /etc/systemd/system/
-	incus exec $(INCUS_INSTANCE) -- sudo systemctl daemon-reload
-
-	@echo "3. Cleaning temporary files..."
-	incus exec $(INCUS_INSTANCE) -- rm -f /home/ubuntu/$(BINARY_NAME) /home/ubuntu/agent.yaml /home/ubuntu/autohost-agent.service
-
+deploy-incus: build
+	@echo "🚀 Desplegando autohost-agent en servidor '$(NAME)'..."
+	@incus info $(NAME) >/dev/null 2>&1 || $(MAKE) create-server NAME=$(NAME)
+	@echo "1. Preparando entorno y usuario del sistema en '$(NAME)'..."
+	incus exec $(NAME) -- sudo id -u autohost >/dev/null 2>&1 || incus exec $(NAME) -- sudo useradd --system --no-create-home --shell /usr/sbin/nologin autohost
+	incus exec $(NAME) -- sudo usermod -aG docker autohost 2>/dev/null || true
+	incus exec $(NAME) -- sudo mkdir -p /etc/autohost /var/lib/autohost
+	incus exec $(NAME) -- sudo chown autohost:autohost /var/lib/autohost
+	@echo "2. Transfiriendo binario y configuración..."
+	incus file push $(BINARY_NAME) $(NAME)/usr/local/bin/$(BINARY_NAME) --mode=0755
+	incus file push configs/agent.yaml $(NAME)/etc/autohost/config.yaml --mode=0640
+	incus exec $(NAME) -- sudo chown root:autohost /etc/autohost/config.yaml
+	incus file push autohost-agent.service $(NAME)/etc/systemd/system/autohost-agent.service --mode=0644
+	incus exec $(NAME) -- sudo systemctl daemon-reload
 	@echo ""
-	@echo "✓ Deployment complete!"
-	@echo ""
-	@echo "Next steps:"
-	@echo "  1. Enable service: incus exec $(INCUS_INSTANCE) -- sudo systemctl enable autohost-agent"
-	@echo "  2. Start service:  incus exec $(INCUS_INSTANCE) -- sudo systemctl start autohost-agent"
-	@echo "  3. Check status:   make status-incus"
+	@echo "✅ Despliegue completado en '$(NAME)'!"
+	@echo "   Para iniciar: make start-incus NAME=$(NAME)"
+	@echo "   Para ver estado: make status-incus NAME=$(NAME)"
 
 update-incus: build
-	@echo "Updating Incus instance $(INCUS_INSTANCE)..."
-	@echo "1. Transferring new binary..."
-	incus file push $(BINARY_NAME) $(INCUS_INSTANCE)/home/ubuntu/
-	@echo "2. Updating binary on instance..."
-	incus exec $(INCUS_INSTANCE) -- sudo mv /home/ubuntu/$(BINARY_NAME) /usr/local/bin/
-	incus exec $(INCUS_INSTANCE) -- sudo chown root:root /usr/local/bin/$(BINARY_NAME)
-	incus exec $(INCUS_INSTANCE) -- sudo chmod 755 /usr/local/bin/$(BINARY_NAME)
-	@echo "3. Cleaning temporary files..."
-	incus exec $(INCUS_INSTANCE) -- rm -f /home/ubuntu/$(BINARY_NAME)
-	@echo "4. Restarting service..."
-	incus exec $(INCUS_INSTANCE) -- sudo systemctl restart autohost-agent
-	@echo "✓ Update complete and service restarted."
+	@INSTANCES=($$(incus list -c n --format csv)); \
+	if [ $${#INSTANCES[@]} -eq 0 ]; then \
+		echo "❌ No hay instancias Incus disponibles."; \
+		exit 1; \
+	elif [ "$$NAME" = "all" ] || [ "$$NAME" = "ALL" ]; then \
+		echo "⚡ Actualizando binario en TODOS los servidores ($${#INSTANCES[@]})..."; \
+		for inst in "$${INSTANCES[@]}"; do \
+			echo "📦 Transfiriendo y reiniciando en '$$inst'..."; \
+			incus file push $(BINARY_NAME) "$$inst/tmp/$(BINARY_NAME)" --mode=0755; \
+			incus exec "$$inst" -- sudo mv -f /tmp/$(BINARY_NAME) /usr/local/bin/$(BINARY_NAME); \
+			incus exec "$$inst" -- sudo systemctl restart autohost-agent; \
+			echo "   ✅ '$$inst' actualizado."; \
+		done; \
+		echo "🎉 Todos los servidores actualizados con éxito."; \
+	elif [ "$$NAME" != "autohost-test" ] && [ -n "$$NAME" ] && incus info "$$NAME" >/dev/null 2>&1; then \
+		echo "🔄 Actualizando binario en '$$NAME'..."; \
+		incus file push $(BINARY_NAME) "$$NAME/tmp/$(BINARY_NAME)" --mode=0755; \
+		incus exec "$$NAME" -- sudo mv -f /tmp/$(BINARY_NAME) /usr/local/bin/$(BINARY_NAME); \
+		incus exec "$$NAME" -- sudo systemctl restart autohost-agent; \
+		echo "✅ Agente actualizado y reiniciado en '$$NAME'."; \
+	else \
+		echo "📋 Servidores Incus disponibles para actualizar:"; \
+		echo ""; \
+		printf "  [\033[1;33m0\033[0m] \033[1;33m⚡ ACTUALIZAR EN TODOS LOS SERVIDORES A LA VEZ\033[0m\n"; \
+		for i in "$${!INSTANCES[@]}"; do \
+			STATUS=$$(incus list "$${INSTANCES[$$i]}" -c s --format csv); \
+			IPV4=$$(incus list "$${INSTANCES[$$i]}" -c 4 --format csv | head -n1); \
+			printf "  [\033[1;32m%d\033[0m] %-20s (\033[1;34m%s\033[0m, %s)\n" "$$((i+1))" "$${INSTANCES[$$i]}" "$$STATUS" "$$IPV4"; \
+		done; \
+		echo ""; \
+		printf "👉 Selecciona el número de servidor [0-%d]: " "$${#INSTANCES[@]}"; \
+		read -r CHOICE; \
+		if [ "$$CHOICE" = "0" ] || [ "$$CHOICE" = "all" ] || [ "$$CHOICE" = "ALL" ]; then \
+			echo ""; \
+			echo "⚡ Actualizando binario en TODOS los servidores ($${#INSTANCES[@]})..."; \
+			for inst in "$${INSTANCES[@]}"; do \
+				echo "📦 Transfiriendo y reiniciando en '$$inst'..."; \
+				incus file push $(BINARY_NAME) "$$inst/tmp/$(BINARY_NAME)" --mode=0755; \
+				incus exec "$$inst" -- sudo mv -f /tmp/$(BINARY_NAME) /usr/local/bin/$(BINARY_NAME); \
+				incus exec "$$inst" -- sudo systemctl restart autohost-agent; \
+				echo "   ✅ '$$inst' actualizado."; \
+			done; \
+			echo "🎉 Todos los servidores actualizados con éxito."; \
+		elif ! [[ "$$CHOICE" =~ ^[0-9]+$$ ]] || [ "$$CHOICE" -lt 1 ] || [ "$$CHOICE" -gt "$${#INSTANCES[@]}" ]; then \
+			echo "❌ Selección inválida"; \
+			exit 1; \
+		else \
+			SELECTED="$${INSTANCES[$$((CHOICE-1))]}"; \
+			echo "🔄 Actualizando binario en '$$SELECTED'..."; \
+			incus file push $(BINARY_NAME) "$$SELECTED/tmp/$(BINARY_NAME)" --mode=0755; \
+			incus exec "$$SELECTED" -- sudo mv -f /tmp/$(BINARY_NAME) /usr/local/bin/$(BINARY_NAME); \
+			incus exec "$$SELECTED" -- sudo systemctl restart autohost-agent; \
+			echo "✅ Agente actualizado y reiniciado en '$$SELECTED'."; \
+		fi; \
+	fi
+
 
 start-incus:
-	@echo "Starting service on Incus instance..."
-	incus exec $(INCUS_INSTANCE) -- sudo systemctl enable autohost-agent
-	incus exec $(INCUS_INSTANCE) -- sudo systemctl start autohost-agent
-	@echo "Service started. Use 'make status-incus' to check status"
+	@echo "▶️  Iniciando autohost-agent en '$(NAME)'..."
+	incus exec $(NAME) -- sudo systemctl enable --now autohost-agent
+	@echo "✅ Servicio iniciado en '$(NAME)'."
 
 stop-incus:
-	@echo "Stopping service on Incus instance..."
-	incus exec $(INCUS_INSTANCE) -- sudo systemctl stop autohost-agent
-	@echo "Service stopped"
+	@echo "⏹  Deteniendo autohost-agent en '$(NAME)'..."
+	incus exec $(NAME) -- sudo systemctl stop autohost-agent
+	@echo "✅ Servicio detenido."
+
+restart-incus:
+	@echo "🔄 Reiniciando autohost-agent en '$(NAME)'..."
+	incus exec $(NAME) -- sudo systemctl restart autohost-agent
+	@echo "✅ Servicio reiniciado en '$(NAME)'."
 
 status-incus:
-	incus exec $(INCUS_INSTANCE) -- sudo systemctl status autohost-agent
+	incus exec $(NAME) -- sudo systemctl status autohost-agent
 
 logs-incus:
-	incus exec $(INCUS_INSTANCE) -- sudo journalctl -u autohost-agent -f
+	incus exec $(NAME) -- sudo journalctl -u autohost-agent -f
 
-shell-incus:
-	incus exec $(INCUS_INSTANCE) -- bash
+shell-incus: shell-server
+
+# ─── Enrollment Helpers ─────────────────────────────────────────────────────
+
+enroll-server: deploy-incus
+	@echo "🔗 Enrolando servidor '$(NAME)' en AutoHost..."
+	@GATEWAY=$$(incus exec $(NAME) -- sh -c "ip route show default" | awk '/default/{print $$3}' | head -1); \
+	 echo "   Host Gateway: $$GATEWAY"; \
+	 echo "🔨 Compilando autohost-cli..."; \
+	 (cd ../autohost-cli && go build -o dist/autohost main.go); \
+	 incus file push ../autohost-cli/dist/autohost $(NAME)/usr/local/bin/autohost --mode=0755; \
+	 echo "🚀 Iniciando asistente 'autohost up'..."; \
+	 incus exec $(NAME) -- env AUTOHOST_CLOUD_URL="http://localhost:3000" AUTOHOST_API_URL="http://$$GATEWAY:8080" autohost up
+
+link-server: deploy-incus
+	@if [ -z "$(TOKEN)" ]; then echo "❌ Error: Especifica el token con TOKEN=<tu_token>"; exit 1; fi
+	@GATEWAY=$$(incus exec $(NAME) -- sh -c "ip route show default" | awk '/default/{print $$3}' | head -1); \
+	 echo "   Host Gateway: $$GATEWAY"; \
+	 echo "🔨 Compilando autohost-cli..."; \
+	 (cd ../autohost-cli && go build -o dist/autohost main.go); \
+	 incus file push ../autohost-cli/dist/autohost $(NAME)/usr/local/bin/autohost --mode=0755; \
+	 echo "🚀 Vinculando nodo con token..."; \
+	 incus exec $(NAME) -- autohost enroll link --api http://$$GATEWAY:8080 --token $(TOKEN) --name $(NAME); \
+	 incus exec $(NAME) -- sudo systemctl restart autohost-agent; \
+	 echo "✅ Servidor '$(NAME)' vinculado y activo en AutoHost."

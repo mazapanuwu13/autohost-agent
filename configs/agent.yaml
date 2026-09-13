@@ -8,3 +8,4 @@ agent_token: ""
 refresh_token: ""
 node_id: ""
 tags: []
+grpc_insecure: true
